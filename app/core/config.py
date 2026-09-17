@@ -18,6 +18,18 @@ class Settings(BaseSettings):
     gateway_success_rate: float = 0.9
     gateway_min_delay_seconds: float = 2.0
     gateway_max_delay_seconds: float = 5.0
+    webhook_signing_secret: str = "local-development-webhook-secret"
+    webhook_ssrf_allowed_hosts: str = "api"
+    rate_limit_window_seconds: float = 60.0
+    rate_limit_max_requests: int = 30
+
+    @property
+    def webhook_ssrf_allowed_hosts_set(self) -> frozenset[str]:
+        return frozenset(
+            host.strip()
+            for host in self.webhook_ssrf_allowed_hosts.split(",")
+            if host.strip()
+        )
 
 
 @cache

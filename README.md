@@ -12,15 +12,15 @@
 app/
 ├── main.py, worker.py        # два процесса: uvicorn-приложение и FastStream-консьюмер
 ├── api/v1/
-│   ├── endpoints/payments.py     # роутер: POST/GET /api/v1/payments
+│   ├── endpoints/payments.py     # роутер: payments + payments/{id}/history
 │   ├── schemas/payments.py       # входные/выходные DTO + canonical_request_hash
-│   ├── dependencies/auth.py      # require_api_key
+│   ├── dependencies/auth.py, rate_limit.py
 │   └── error_handlers.py         # доменная ошибка -> HTTP-ответ
-├── core/                     # сквозные вещи: конфиг, DI, брокер, БД, логирование
-│   ├── config.py, db.py, broker.py, di.py, logging.py
+├── core/                     # сквозные вещи: конфиг, DI, брокер, БД, логирование, SSRF-guard
+│   ├── config.py, db.py, broker.py, di.py, logging.py, ssrf_guard.py
 ├── domain/
-│   ├── models.py, errors.py      # SQLAlchemy-модели, доменные исключения
-│   └── services/                 # бизнес-логика: payments, consumer, gateway, outbox, retry, webhook
+│   ├── models.py, errors.py      # SQLAlchemy-модели (+ payment_history), доменные исключения
+│   └── services/                 # payments, consumer, gateway, outbox, retry, webhook, history
 └── events/v1/
     ├── handlers/payments_handler.py  # router-фабрика для FastStream
     └── schemas/payments.py           # схема события payments.new
@@ -115,7 +115,11 @@ curl -sS http://localhost:8000/api/v1/payments/<payment_id> \
   -H 'X-API-Key: local-development-key'
 ```
 
-Повтор POST с тем же `Idempotency-Key` и тем же телом вернёт существующий платёж. То же ключ, другое тело — `409`.
+Повтор POST с тем же `Idempotency-Key` и тем же телом вернёт существующий платёж. То же ключ, другое тело — `409`. Ключ ограничен 255 символами на уровне заголовка (совпадает с колонкой в БД, чтобы слишком длинный ключ падал чистым `422`, а не сырой ошибкой БД).
+
+Ключ живёт **вечно** — он не отдельная запись с TTL, а колонка на самой записи `payments` (`uq_payments_idempotency_key`), поэтому его retention совпадает с retention самого платежа. Это осознанный выбор в пользу аудита (Stripe, для сравнения, по умолчанию хранит ключ 24 часа), а не забытый TTL: отдельная таблица-кэш с собственным жизненным циклом добавила бы сложности ради возможности нарочно забыть, что было оплачено.
+
+`amount` валидируется по точности **валюты**, не глобально: `CURRENCY_DECIMAL_PLACES` в [app/domain/models.py](app/domain/models.py) — 2 знака для RUB/USD/EUR сегодня, но если добавится JPY (0 знаков) или KWD (3 знака), их придётся явно завести в этом словаре, а не тихо сломать округление.
 
 Демо-приёмники вебхуков (без API-ключа, их вызывает consumer):
 
@@ -154,6 +158,27 @@ Prefetch consumer равен 10: пачка платежей обрабатыв�
 
 Очереди в management UI (`:15672`, вкладка Queues): `payments.new`, `payments.retry.2s`, `payments.retry.4s`, `payments.new.dlq`.
 
+## Безопасность вебхука
+
+**Подпись.** Каждый webhook подписан: `X-Webhook-Signature` — hex HMAC-SHA256 от `"{timestamp}." + raw_body`, `X-Webhook-Timestamp` — unix-время в секундах (`WEBHOOK_SIGNING_SECRET`, тот же секрет на api и consumer, публикующем платёж не нужен). Таймстемп — часть подписываемого сообщения, а не соседний заголовок, поэтому перехваченную подпись нельзя переиграть с другим временем. Получатель должен пересчитать HMAC с общим секретом через `hmac.compare_digest` и отклонять запросы старше нескольких минут (реализация подписи — [app/domain/services/webhook.py](app/domain/services/webhook.py):`sign_webhook_body`).
+
+**SSRF-защита.** `webhook_url` резолвится и проверяется **на каждую отправку**, не только при создании платежа (DNS может измениться между попытками) — приватные/loopback/link-local/reserved-адреса (включая `169.254.169.254`) отклоняются до похода в сеть ([app/core/ssrf_guard.py](app/core/ssrf_guard.py)). `WEBHOOK_SSRF_ALLOWED_HOSTS` — явный allowlist имён хостов, минующих резолвинг; по умолчанию туда входит только `api` — свой же демо-приёмник в docker-сети.
+
+**Гонка на отправке.** Два одновременных обработчика одного и того же `payment_id` (дубль из outbox после падения relay, или overlap ретрая) раньше могли оба увидеть `webhook_delivered_at IS NULL` и оба отправить webhook. `claim_webhook_delivery` в [app/domain/services/consumer.py](app/domain/services/consumer.py) резервирует отправку условным `UPDATE ... WHERE webhook_delivered_at IS NULL` **до** похода в сеть — тем же паттерном, что `claim_payment` уже использовал для исхода шлюза; при неудачной отправке `release_webhook_claim` откатывает флаг, чтобы retry/DLQ сработали как обычно. Проверено на реальном Postgres в [tests/integration/test_consumer.py](tests/integration/test_consumer.py).
+
+## Rate limiting
+
+`POST /api/v1/payments` и `GET /api/v1/payments/{id}` лимитируются по `X-API-Key` (не по IP — это авторизованная сущность), скользящее окно в памяти процесса ([app/api/v1/dependencies/rate_limit.py](app/api/v1/dependencies/rate_limit.py)). In-memory осознанно: api и так работает одним uvicorn-воркером (см. выше), общий стор типа Redis не нужен для корректности. `RATE_LIMIT_WINDOW_SECONDS` / `RATE_LIMIT_MAX_REQUESTS`, превышение — `429`.
+
+## История платежа (аудит)
+
+`payments` хранит только текущее состояние. Каждый переход состояния пишется дополнительно в append-only `payment_history` (никаких `UPDATE`/`DELETE` — только `INSERT`): `created`, `gateway_succeeded`/`gateway_failed`, `webhook_delivered`, `webhook_delivery_failed`. Регуляторы (SEC/FCA/MAS и аналоги) в реальном финтехе требуют именно такой неизменяемый журнал, а не только финальный статус — здесь это минимальная версия того же принципа.
+
+```bash
+curl -sS http://localhost:8000/api/v1/payments/<payment_id>/history \
+  -H 'X-API-Key: local-development-key'
+```
+
 ## Тесты
 
 `tests/unit/` (без Postgres и брокера) и `tests/integration/` (нужен `DATABASE_URL`) — 1:1 с делением на быстрые и требующие инфраструктуры, `pytest.mark.integration` расставлен по файлам, а не по каждому тесту.
@@ -188,3 +213,7 @@ DATABASE_URL=postgresql+asyncpg://payments:payments@localhost:5432/payments \
 | `PUBLISH_TIMEOUT_SECONDS` | Таймаут publish (relay и retry) |
 | `WEBHOOK_TIMEOUT_SECONDS` | Таймаут одного HTTP POST |
 | `CONSUMER_PREFETCH_COUNT` | QoS prefetch, по умолчанию 10 |
+| `WEBHOOK_SIGNING_SECRET` | Секрет HMAC-подписи вебхука (`X-Webhook-Signature`) |
+| `WEBHOOK_SSRF_ALLOWED_HOSTS` | Хосты через запятую, минующие SSRF-резолвинг (по умолчанию `api`) |
+| `RATE_LIMIT_WINDOW_SECONDS` | Окно rate limit на API-ключ, по умолчанию 60 |
+| `RATE_LIMIT_MAX_REQUESTS` | Лимит запросов за окно на API-ключ, по умолчанию 30 |

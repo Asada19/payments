@@ -13,8 +13,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.broker import PAYMENTS_EXCHANGE
 from app.core.config import Settings, get_settings
 from app.domain.errors import PaymentNotFoundError
-from app.domain.models import Payment, PaymentStatus
+from app.domain.models import Payment, PaymentHistoryEventType, PaymentStatus
 from app.domain.services.gateway import emulate_gateway
+from app.domain.services.history import record_history_event
 from app.domain.services.retry import Decision, NextAction, decide_next_action
 from app.domain.services.webhook import (
     WebhookDeliveryError,
@@ -36,20 +37,42 @@ async def claim_payment(
         .where(Payment.id == payment_id, Payment.status == PaymentStatus.pending)
         .values(status=new_status, processed_at=datetime.now(UTC))
     )
+    claimed = isinstance(result, CursorResult) and result.rowcount == 1
+    if claimed:
+        event_type = (
+            PaymentHistoryEventType.gateway_succeeded
+            if new_status == PaymentStatus.succeeded
+            else PaymentHistoryEventType.gateway_failed
+        )
+        record_history_event(session, payment_id, event_type)
     await session.commit()
-    if not isinstance(result, CursorResult):
-        return False
-    return result.rowcount == 1
+    return claimed
 
 
-async def mark_webhook_delivered(session: AsyncSession, payment_id: UUID) -> None:
+async def claim_webhook_delivery(session: AsyncSession, payment_id: UUID) -> bool:
+    """Atomically reserve the right to send the webhook for this payment.
+
+    Two concurrent handlers for the same payment_id (an outbox double-publish
+    after a relay crash, or an overlapping redelivery) would otherwise both
+    read webhook_delivered_at IS NULL and both POST -- this conditional UPDATE
+    makes only one of them win, mirroring claim_payment's own pattern above.
+    """
+    result = await session.execute(
+        update(Payment)
+        .where(Payment.id == payment_id, Payment.webhook_delivered_at.is_(None))
+        .values(webhook_delivered_at=datetime.now(UTC))
+    )
+    await session.commit()
+    return isinstance(result, CursorResult) and result.rowcount == 1
+
+
+async def release_webhook_claim(session: AsyncSession, payment_id: UUID) -> None:
+    """Undo claim_webhook_delivery after a failed send, so the retry/DLQ path
+    (which re-checks webhook_delivered_at IS NULL) can try again."""
     await session.execute(
         update(Payment)
-        .where(
-            Payment.id == payment_id,
-            Payment.webhook_delivered_at.is_(None),
-        )
-        .values(webhook_delivered_at=datetime.now(UTC))
+        .where(Payment.id == payment_id)
+        .values(webhook_delivered_at=None)
     )
     await session.commit()
 
@@ -130,19 +153,35 @@ async def handle_payment_event(
         if payment.webhook_delivered_at is None:
             if payment.processed_at is None or payment.status == PaymentStatus.pending:
                 raise RuntimeError("payment is not terminal before webhook")
-            payload = WebhookPayload(
-                payment_id=payment.id,
-                status=payment.status,
-                amount=payment.amount,
-                currency=payment.currency,
-                processed_at=payment.processed_at,
-            )
-            await send_webhook(
-                payment.webhook_url,
-                payload,
-                timeout=cfg.webhook_timeout_seconds,
-            )
-            await mark_webhook_delivered(session, payment.id)
+            claimed_webhook = await claim_webhook_delivery(session, payment.id)
+            if not claimed_webhook:
+                logger.info(
+                    "webhook delivery already claimed elsewhere payment_id=%s",
+                    payment.id,
+                )
+            else:
+                payload = WebhookPayload(
+                    payment_id=payment.id,
+                    status=payment.status,
+                    amount=payment.amount,
+                    currency=payment.currency,
+                    processed_at=payment.processed_at,
+                )
+                try:
+                    await send_webhook(
+                        payment.webhook_url,
+                        payload,
+                        timeout=cfg.webhook_timeout_seconds,
+                        signing_secret=cfg.webhook_signing_secret,
+                        ssrf_allowed_hosts=cfg.webhook_ssrf_allowed_hosts_set,
+                    )
+                except Exception:
+                    await release_webhook_claim(session, payment.id)
+                    raise
+                record_history_event(
+                    session, payment.id, PaymentHistoryEventType.webhook_delivered
+                )
+                await session.commit()
 
         await msg.ack()
         logger.info(
@@ -179,6 +218,20 @@ async def handle_payment_event(
         except Exception:
             logger.exception("session rollback failed")
         decision = decide_next_action(attempt, ok=False)
+        if decision.action == NextAction.DLQ:
+            try:
+                record_history_event(
+                    session,
+                    event.payment_id,
+                    PaymentHistoryEventType.webhook_delivery_failed,
+                    detail={"error": str(exc)},
+                )
+                await session.commit()
+            except Exception:
+                logger.exception(
+                    "failed to record dlq history event payment_id=%s",
+                    event.payment_id,
+                )
         try:
             await apply_decision(
                 decision,

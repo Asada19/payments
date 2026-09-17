@@ -31,6 +31,19 @@ class Currency(enum.StrEnum):
     EUR = "EUR"
 
 
+CURRENCY_DECIMAL_PLACES: dict[Currency, int] = {
+    Currency.RUB: 2,
+    Currency.USD: 2,
+    Currency.EUR: 2,
+}
+"""Minor-unit precision per currency (ISO 4217 exponent).
+
+Kept explicit and per-currency rather than a single global constant: RUB/USD/EUR
+are all 2 today, but currencies like JPY (0) or KWD (3) would silently corrupt
+amounts under a single hardcoded ``decimal_places``.
+"""
+
+
 class PaymentStatus(enum.StrEnum):
     pending = "pending"
     succeeded = "succeeded"
@@ -40,6 +53,14 @@ class PaymentStatus(enum.StrEnum):
 class OutboxStatus(enum.StrEnum):
     pending = "pending"
     published = "published"
+
+
+class PaymentHistoryEventType(enum.StrEnum):
+    created = "created"
+    gateway_succeeded = "gateway_succeeded"
+    gateway_failed = "gateway_failed"
+    webhook_delivered = "webhook_delivered"
+    webhook_delivery_failed = "webhook_delivery_failed"
 
 
 def _enum_values(enum_cls: type[enum.Enum]) -> list[str]:
@@ -129,6 +150,42 @@ class OutboxEvent(Base):
     )
 
     payment: Mapped[Payment] = relationship(back_populates="outbox_events")
+
+
+class PaymentHistoryEvent(Base):
+    """Append-only audit trail of everything that happened to a payment.
+
+    Rows are never updated or deleted -- ``payments`` holds current state,
+    this table holds the history of how it got there (regulators expect a
+    write-once record of state transitions, not just the final status).
+    """
+
+    __tablename__ = "payment_history"
+    __table_args__ = (
+        Index("ix_payment_history_payment_id_created_at", "payment_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    payment_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("payments.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    event_type: Mapped[PaymentHistoryEventType] = mapped_column(
+        Enum(
+            PaymentHistoryEventType,
+            native_enum=False,
+            length=32,
+            values_callable=_enum_values,
+        ),
+        nullable=False,
+    )
+    detail: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
 
 
 PAYMENTS_NEW_EVENT = "payments.new"

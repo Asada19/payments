@@ -13,8 +13,11 @@ from app.domain.models import (
     OutboxEvent,
     OutboxStatus,
     Payment,
+    PaymentHistoryEvent,
+    PaymentHistoryEventType,
     PaymentStatus,
 )
+from app.domain.services.history import list_history_events, record_history_event
 
 
 async def create_payment(
@@ -44,6 +47,7 @@ async def create_payment(
 
     session.add(payment)
     session.add(event)
+    record_history_event(session, payment_id, PaymentHistoryEventType.created)
     try:
         await session.commit()
     except IntegrityError:
@@ -66,3 +70,10 @@ async def get_payment(session: AsyncSession, payment_id: uuid.UUID) -> Payment:
     if payment is None:
         raise PaymentNotFoundError(payment_id)
     return payment
+
+
+async def get_payment_history(
+    session: AsyncSession, payment_id: uuid.UUID
+) -> list[PaymentHistoryEvent]:
+    await get_payment(session, payment_id)  # 404 if the payment itself doesn't exist
+    return await list_history_events(session, payment_id)
